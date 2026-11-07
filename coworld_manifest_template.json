@@ -25,7 +25,7 @@
         "/bin/rumor"
       ],
       "env": {},
-      "source_url": "https://github.com/Metta-AI/cogame-rumor/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-rumor/tree/main"
     },
     "config_schema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -378,7 +378,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-rumor/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-rumor/tree/main"
     },
     {
       "id": "rumor-gossip",
@@ -401,7 +401,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-rumor/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-rumor/tree/main"
     },
     {
       "id": "rumor-herd",
@@ -424,7 +424,7 @@
           "cpu": "1"
         }
       },
-      "source_url": "https://github.com/Metta-AI/cogame-rumor/tree/main"
+      "source_url": "https://github.com/softmax-universe/cogame-rumor/tree/main"
     }
   ],
   "variants": [
