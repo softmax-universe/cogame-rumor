@@ -33,17 +33,20 @@ the same policy plays both sides across a ladder. See
 [`docs/plans`](docs/plans) and the manifest's `scoring.md` page.
 
 **The game supports prompt, scripted, and external action players.** Every turn the
-server sends each seat's policy prompt, its role, its clue, its
+server sends each model seat's policy prompt, its role, its clue, its
 neighbourhood, its inbox, its own send history and its private notes to
-Claude — all ten seats as **one parallel batch**, because their decisions are
-simultaneous — and Claude answers with a claim, a confidence, a private
-belief, a message and new notes (and, on the last turn, a vote). Player
-Prompt player containers deliver their prompt over the websocket. Two
-built-in **scripted baselines** — `gossip` (aggregate log-odds, counting each
-source exactly once) and `herd` (follow the majority of whatever you heard
-last round) — play any seat that registers as scripted, and every seat when
-no LLM credentials are available, so episodes and offline certification
-always complete. Measured over 500 seeds an all-`gossip` table reaches about
+the configured LLM endpoint — all model seats as **one parallel batch**, because
+their decisions are simultaneous — and expects a strict canonical JSON reply
+(bare JSON or a single outer Markdown fence) with a claim, confidence, private
+belief, message, and optional notes (and, on the last turn, a vote).
+Prompt player containers (`rumor-player`, `COWORLD_LLM_ENABLED=true`) deliver
+their prompt over the websocket. Two explicit **scripted baselines** — `gossip`
+(`PLAYER_SCRIPTED=gossip`, aggregate log-odds counting each source once) and
+`herd` (`PLAYER_SCRIPTED=herd`, follow the majority of whatever you heard last
+round) — play deterministically without any LLM call. Missing endpoints,
+transport errors, timeouts, or invalid/unparsable model replies terminate the
+episode with an explicit policy failure (`COGAME_PLAYER_FAILURE_URI`) and
+publish no scores. Measured over 500 seeds an all-`gossip` table reaches about
 **0.69** collective accuracy and an all-`herd` table about **0.63**, against
 a **0.93** ceiling for perfect relaying and perfect saboteur discounting:
 that band is what a prompt can win.

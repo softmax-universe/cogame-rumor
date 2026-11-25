@@ -329,7 +329,7 @@
     "docs": {
       "readme": {
         "type": "text",
-        "value": "Rumor seats ten cogs on a hidden social graph. One binary fact is true; each cog gets a private clue that is right about 60% of the time, and the ten clues together always point at the truth (they split 6-4, 7-3 or 8-2 in its favour). Two or three of the ten are saboteurs, dealt from the seed, paid to make the honest cogs vote the other way. A cog can message only its graph neighbours, and only they read it - one hop, one round later. After five rounds of simultaneous talk every seat casts a sealed vote; the tally opens the ballots, reveals the truth and takes the saboteurs' masks off. Honest seats score 0.6 x the honest bloc's accuracy + 0.4 x their own vote; saboteurs score the mirror of the first term plus 0.4 x how wrong their own honest neighbours were. Both are in [-1, +1] and higher is better. A policy is just a prompt: field one by reusing the published rumor-player runnable with PLAYER_PROMPT set to your strategy. Two scripted baselines - gossip (aggregate, but count each source only once) and herd (follow the room) - play any seat that registers scripted, and every seat when no LLM credentials are available, so episodes always complete."
+        "value": "Rumor seats ten cogs on a hidden social graph. One binary fact is true; each cog gets a private clue that is right about 60% of the time, and the ten clues together always point at the truth (they split 6-4, 7-3 or 8-2 in its favour). Two or three of the ten are saboteurs, dealt from the seed, paid to make the honest cogs vote the other way. A cog can message only its graph neighbours, and only they read it - one hop, one round later. After five rounds of simultaneous talk every seat casts a sealed vote; the tally opens the ballots, reveals the truth and takes the saboteurs' masks off. Honest seats score 0.6 x the honest bloc's accuracy + 0.4 x their own vote; saboteurs score the mirror of the first term plus 0.4 x how wrong their own honest neighbours were. Both are in [-1, +1] and higher is better. Model policies use rumor-player with COWORLD_LLM_ENABLED=true and optional PLAYER_PROMPT; missing endpoints, timeouts, or invalid model replies end the episode as an explicit policy failure without scores. Two explicit scripted baselines - gossip (PLAYER_SCRIPTED=gossip) and herd (PLAYER_SCRIPTED=herd) - play deterministically without an LLM."
       },
       "pages": [
         {
@@ -364,11 +364,15 @@
       "id": "rumor-player",
       "name": "Rumor Prompt Player",
       "type": "player",
-      "description": "The reference Rumor policy: delivers its PLAYER_PROMPT (or a default dual-role strategy in words, since the role is dealt after seating) to the game and spectates until the final frame. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
+      "description": "The reference Rumor model policy: delivers its PLAYER_PROMPT (or a default dual-role strategy in words, since the role is dealt after seating) to the game and spectates until the final frame. Field your own policy by uploading this same image with a different PLAYER_PROMPT.",
       "image": "{{RUMOR_IMAGE}}",
       "run": [
         "/bin/rumor-player"
       ],
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "resources": {
         "requests": {
           "cpu": "100m",

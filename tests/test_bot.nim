@@ -108,8 +108,20 @@ suite "scripted baselines":
       check sim.firstClaims(seat).len == 1
       check abs(sim.gossipLogOdds(seat) - (base + ClaimLogOdds)) < 1e-9
 
-suite "llm fallback and parsing":
-  test "with no credentials every seat plays scripted, with no wait":
+suite "llm failure and strict parsing":
+  test "with no credentials explicit scripted seats complete, model seats fail without fallback":
+    let savedKeys = [
+      "COWORLD_LLM_ENDPOINT", "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
+      "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI"
+    ]
+    var savedVals: seq[tuple[key: string, exists: bool, val: string]]
+    for k in savedKeys:
+      savedVals.add((k, existsEnv(k), getEnv(k)))
+      delEnv(k)
+    defer:
+      for entry in savedVals:
+        if entry.exists: putEnv(entry.key, entry.val)
+        else: delEnv(entry.key)
     let config = fixture(3, rounds = 3)
     let client = newLlmClient(config)
     check client.disabled
@@ -117,21 +129,20 @@ suite "llm fallback and parsing":
     let seats = sim.pendingSeats()
     var prompts = newSeq[string](Seats)
     prompts[0] = "be bold"
-    var kinds = newSeq[ScriptKind](Seats)
-    kinds[2] = skHerd
+    ## All-scripted seats complete with no LLM call and no wait.
+    var allScripted = newSeq[ScriptKind](Seats)
+    for seat in 0 ..< Seats:
+      allScripted[seat] = if seat == 2: skHerd else: skGossip
     let started = getMonoTime()
-    let decisions = client.decideAll(sim, seats, prompts, kinds)
+    let decisions = client.decideAll(sim, seats, prompts, allScripted)
     let elapsed = (getMonoTime() - started).inMilliseconds
     check decisions.len == Seats
-    ## No network call and no rate-governor sleep.
     check elapsed < 500
     for index, seat in seats:
       let kind = if seat == 2: skHerd else: skGossip
       let expected = scriptedAction(sim, seat, kind)
       check decisions[index].claim == expected.claim
       check decisions[index].message == expected.message
-      ## Provenance: every baseline decision says so, and the flag reaches
-      ## the event and the replay JSON.
       check decisions[index].scripted
       sim.applyMessage(seat, decisions[index].claim,
         decisions[index].confidence, decisions[index].belief,
@@ -142,99 +153,106 @@ suite "llm fallback and parsing":
         check event.scripted
         check event.eventToJson()["scripted"].getBool()
 
-  test "PLAYER_SCRIPTED spellings":
-    check parseScriptKind("1") == skGossip
-    check parseScriptKind("gossip") == skGossip
-    check parseScriptKind("TRUE") == skGossip
-    check parseScriptKind("herd") == skHerd
-    check parseScriptKind("") == skNone
-    check parseScriptKind("nonsense") == skNone
+    ## A model seat (skNone) with no credentials raises ModelDecisionError
+    ## rather than fabricating a scripted move.
+    var mixed = allScripted
+    mixed[4] = skNone
+    var failedSeat = -1
+    try:
+      discard client.decideAll(sim, sim.pendingSeats(), prompts, mixed)
+    except ModelDecisionError as error:
+      failedSeat = error.seat
+    check failedSeat == 4
 
-  test "talk replies parse tolerantly and cap every field":
+  test "PLAYER_SCRIPTED accepts only canonical values":
+    check parseScriptKind("") == skNone
+    check parseScriptKind("gossip") == skGossip
+    check parseScriptKind("GOSSIP") == skGossip
+    check parseScriptKind("herd") == skHerd
+    for bad in ["1", "true", "yes", "follow", "nonsense"]:
+      expect RumorError:
+        discard parseScriptKind(bad)
+
+  test "talk replies enforce canonical JSON fields and cap text":
     let sim = initSim(fixture(9))
-    let a = sim.optionA
-    let b = sim.optionB
+    let parsed = sim.parseTalkReply(parseJson(
+      """{"claim":"A","confidence":72,"belief":70,"message":"hi"}"""))
+    check parsed.claim == "A"
+    check parsed.confidence == 72
+    check parsed.belief == 70
+    check parsed.message == "hi"
+    check not parsed.scripted
     check sim.parseTalkReply(parseJson(
-      """{"claim":"A","confidence":72,"belief":70,"message":"hi"}""")
-      ).claim == "A"
-    ## A model reply is never marked scripted; only the baseline is.
-    check not sim.parseTalkReply(parseJson(
-      """{"claim":"A","message":"hi"}""")).scripted
+      """{"claim":"B","confidence":80,"belief":20,"message":"hi"}""")).claim == "B"
     check sim.parseTalkReply(parseJson(
-      """{"claim":"b","message":"hi"}""")).claim == "B"
-    check sim.parseTalkReply(parseJson(
-      "{\"claim\":\"" & a & "\",\"message\":\"hi\"}")).claim == "A"
-    check sim.parseTalkReply(parseJson(
-      "{\"claim\":\"" & b.toLowerAscii() & "\",\"message\":\"hi\"}")
-      ).claim == "B"
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"maybe","message":"hi"}""")).claim == "none"
-    check sim.parseTalkReply(parseJson(
-      """{"claim":null,"message":"hi"}""")).claim == "none"
-    ## Numbers: strings and floats coerce, out-of-range clamps.
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"A","confidence":"81","message":"hi"}""")
-      ).confidence == 81
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"A","confidence":80.6,"message":"hi"}""")
-      ).confidence == 81
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"A","confidence":173,"message":"hi"}""")
-      ).confidence == 100
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"A","confidence":-4,"message":"hi"}""")).confidence == 0
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"A","confidence":"lots","message":"hi"}""")
-      ).confidence == 50
-    ## A missing belief is derived from claim + confidence.
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"A","confidence":72,"message":"hi"}""")).belief == 72
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"B","confidence":72,"message":"hi"}""")).belief == 28
-    check sim.parseTalkReply(parseJson(
-      """{"claim":"none","message":"hi"}""")).belief == 50
-    ## Neither a claim nor a message is the one invalid talk reply.
-    expect RumorError:
-      discard sim.parseTalkReply(parseJson("""{"claim":"maybe"}"""))
-    expect RumorError:
-      discard sim.parseTalkReply(parseJson("""{"notes":"nothing"}"""))
+      """{"claim":"none","confidence":50,"belief":50,"message":"hi"}""")).claim == "none"
+    ## Legacy aliases, out-of-range numbers, and string coercion are rejected.
+    for bad in [
+      """{"claim":"a","confidence":70,"belief":70,"message":"hi"}""",
+      """{"claim":"1","confidence":70,"belief":70,"message":"hi"}""",
+      """{"claim":1,"confidence":70,"belief":70,"message":"hi"}""",
+      """{"claim":"maybe","confidence":70,"belief":70,"message":"hi"}""",
+      """{"claim":null,"confidence":70,"belief":70,"message":"hi"}""",
+      """{"claim":"A","confidence":"81","belief":70,"message":"hi"}""",
+      """{"claim":"A","confidence":80.6,"belief":70,"message":"hi"}""",
+      """{"claim":"A","confidence":173,"belief":70,"message":"hi"}""",
+      """{"claim":"A","confidence":-4,"belief":70,"message":"hi"}""",
+      """{"claim":"A","confidence":"lots","belief":70,"message":"hi"}""",
+      """{"claim":"A","confidence":70,"message":"hi"}""",
+      """{"claim":"A","confidence":70,"belief":70}""",
+      """{"claim":"none","confidence":50,"belief":50,"message":""}""",
+      """{"notes":"nothing"}"""
+    ]:
+      expect RumorError:
+        discard sim.parseTalkReply(parseJson(bad))
     ## Caps, on rune boundaries.
     let longText = "日".repeat(900)
     let capped = sim.parseTalkReply(parseJson(
-      $ %*{"claim": "A", "message": longText, "notes": longText}))
+      $ %*{"claim": "A", "confidence": 60, "belief": 60,
+           "message": longText, "notes": longText}))
     check capped.message.runeLen == MaxMessageLen
     check capped.notes.runeLen == MaxNotesLen
     check capped.message.validateUtf8() == -1
     check capped.notes.validateUtf8() == -1
 
-  test "ballot replies require a parsable vote":
+  test "ballot replies require canonical vote and valid optional fields":
     let sim = initSim(fixture(9))
-    let a = sim.optionA
-    check sim.parseVoteReply(parseJson(
-      """{"vote":"A","belief":85,"reason":"three to one"}""")).vote == "A"
-    check not sim.parseVoteReply(parseJson("""{"vote":"A"}""")).scripted
-    check sim.parseVoteReply(parseJson("""{"vote":"b"}""")).vote == "B"
-    check sim.parseVoteReply(parseJson("""{"vote":1}""")).vote == "A"
-    check sim.parseVoteReply(parseJson("""{"vote":"2"}""")).vote == "B"
-    check sim.parseVoteReply(parseJson(
-      "{\"vote\":\"" & a & "\"}")).vote == "A"
-    check sim.parseVoteReply(parseJson(
-      """{"vote":"A","belief":140}""")).belief == 100
-    expect RumorError:
-      discard sim.parseVoteReply(parseJson("""{"belief":50}"""))
-    expect RumorError:
-      discard sim.parseVoteReply(parseJson("""{"vote":"maybe"}"""))
+    let v = sim.parseVoteReply(parseJson(
+      """{"vote":"A","belief":85,"reason":"three to one"}"""))
+    check v.vote == "A"
+    check v.belief == 85
+    check not v.scripted
+    check sim.parseVoteReply(parseJson("""{"vote":"A"}""")).belief == 75
+    check sim.parseVoteReply(parseJson("""{"vote":"B"}""")).belief == 25
+    for bad in [
+      """{"belief":50}""",
+      """{"vote":"a"}""",
+      """{"vote":"1"}""",
+      """{"vote":1}""",
+      """{"vote":"maybe"}""",
+      """{"vote":"A","belief":140}""",
+      """{"vote":"A","belief":"80"}"""
+    ]:
+      expect RumorError:
+        discard sim.parseVoteReply(parseJson(bad))
     let longText = "日".repeat(900)
     let capped = sim.parseVoteReply(parseJson(
       $ %*{"vote": "A", "reason": longText, "notes": longText}))
     check capped.reason.runeLen == MaxReasonLen
     check capped.notes.runeLen == MaxNotesLen
 
-  test "extractJsonObject tolerates fences and prose":
+  test "extractJsonObject accepts bare JSON or one outer fence and rejects prose":
+    check extractJsonObject("""{"vote":"A"}"""){"vote"}.getStr() == "A"
     check extractJsonObject("```json\n{\"vote\":\"A\"}\n```"
       ){"vote"}.getStr() == "A"
+    check extractJsonObject("```\n{\"vote\":\"B\"}\n```"
+      ){"vote"}.getStr() == "B"
     expect RumorError:
       discard extractJsonObject("I think the answer is BROKEN.")
+    expect RumorError:
+      discard extractJsonObject("Here is my vote: {\"vote\":\"A\"}")
+    expect RumorError:
+      discard extractJsonObject("[1, 2, 3]")
 
   test "captured error text is cut on rune boundaries":
     ## The quoted head of an unusable reply is echoed to the hosted log; a
@@ -301,49 +319,30 @@ suite "prompts":
     check "\"vote\"" in user
     check "\"claim\"" notin user
 
-suite "the retry path":
-  test "a dead transport retries once, falls back, and records it":
-    ## The one decision path no test covered: a real batch that fails at the
-    ## transport, a second batch that fails the same way, and the scripted
-    ## baseline standing in — recorded as scripted in the decision, the
-    ## event and the replay JSON. The endpoint is a closed port, so both
-    ## attempts fail in milliseconds and the wall clock is the rate
-    ## governor's spacing between them.
-    putEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "http://127.0.0.1:1")
-    putEnv("AWS_BEARER_TOKEN_BEDROCK", "not-a-token")
+suite "model transport failure":
+  test "a dead transport raises ModelDecisionError immediately without fallback":
+    putEnv("COWORLD_LLM_ENDPOINT", "http://127.0.0.1:1")
+    putEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
     let config = fixture(5, rounds = 3)
     let client = newLlmClient(config)
-    delEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME")
-    delEnv("AWS_BEARER_TOKEN_BEDROCK")
-    ## Not the no-credentials shortcut: this client really dispatches.
+    delEnv("COWORLD_LLM_ENDPOINT")
+    delEnv("COWORLD_LLM_MODEL")
     check not client.disabled
-    var sim = initSim(config)
+    let sim = initSim(config)
     let seats = sim.pendingSeats()
     let prompts = newSeq[string](Seats)
-    ## Nobody is registered as a scripted seat, so anything scripted in the
-    ## result came from the fallback.
-    let kinds = newSeq[ScriptKind](Seats)
+    var kinds = newSeq[ScriptKind](Seats)
+    for seat in 0 ..< Seats:
+      kinds[seat] = if seat == 3: skNone else: skGossip
+    var failedSeat = -1
+    var failedMsg = ""
     let started = getMonoTime()
-    let decisions = client.decideAll(sim, seats, prompts, kinds)
+    try:
+      discard client.decideAll(sim, seats, prompts, kinds)
+    except ModelDecisionError as error:
+      failedSeat = error.seat
+      failedMsg = error.msg
     let elapsed = (getMonoTime() - started).inMilliseconds.int
-    check decisions.len == Seats
-    ## Two dispatches with one rate-governor spacing between them, and the
-    ## whole turn inside its hard budget.
-    check elapsed >= MinBatchSpacingSeconds * 1000
-    check elapsed < TurnBudgetSeconds * 1000
-    for index, seat in seats:
-      let expected = scriptedAction(sim, seat, skGossip)
-      check decisions[index].claim == expected.claim
-      check decisions[index].message == expected.message
-      check decisions[index].scripted
-      sim.applyMessage(seat, decisions[index].claim,
-        decisions[index].confidence, decisions[index].belief,
-        decisions[index].message, decisions[index].notes,
-        decisions[index].scripted)
-    var says = 0
-    for event in sim.events:
-      if event.kind == evSay:
-        inc says
-        check event.scripted
-        check event.eventToJson()["scripted"].getBool()
-    check says == Seats
+    check failedSeat == 3
+    check "seat 3 model decision failed" in failedMsg
+    check elapsed < 5000

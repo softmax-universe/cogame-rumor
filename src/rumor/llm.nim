@@ -3,24 +3,22 @@
 ## neighbourhood, inbox, own history, notes) plus that seat's prompt and
 ## asks Claude what it says (and, on the last turn, how it votes).
 ##
-## Decisions within a turn are SIMULTANEOUS by rule, so all ten requests go
-## out as ONE parallel batch (curly.makeRequests); invalid replies are
-## retried as a smaller batch carrying a hint, and anything still failing
-## falls back to the scripted baseline.
+## Decisions within a turn are SIMULTANEOUS by rule, so all open model
+## requests go out as ONE parallel batch (curly.makeRequests). Any missing
+## endpoint, transport error, timeout, or invalid/unparsable reply for a
+## model seat raises ModelDecisionError rather than fabricating a scripted
+## move.
 ##
 ## Credentials, in order of preference:
 ##   COWORLD_LLM_ENDPOINT            - hosted sidecar
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## With no credentials every decision falls back to the always-legal
-## scripted baseline immediately (no retries, no network waits, no
-## rate-governor sleep) so offline certification still completes - this
-## fallback is load-bearing. The same scripted bots are also fieldable
-## policies: a player that registers as scripted plays one deliberately.
+## Explicit scripted seats (gossip / herd) run deterministically without any
+## LLM call.
 
 import
-  std/[json, math, os, strutils, times, unicode],
+  std/[json, os, strutils, times, unicode],
   bitworld/runtime,
   curly,
   crunchy,
@@ -37,6 +35,9 @@ analysis, no explanation, no markdown fences, no text before or after
 the object. Your reply must begin with the character { and end with }."""
 
 type
+  ModelDecisionError* = object of RumorError
+    seat*: int
+
   ScriptKind* = enum
     skNone = "none"
     skGossip = "gossip"
@@ -72,12 +73,15 @@ type
     disabled*: bool   ## true once credentials are known-unavailable
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"gossip" play the aggregating
-  ## baseline, "herd" the follow-the-room baseline, anything else nothing.
-  case text.strip().toLowerAscii()
-  of "1", "true", "yes", "gossip": skGossip
-  of "herd", "follow": skHerd
-  else: skNone
+  ## PLAYER_SCRIPTED values: "" for model play, "gossip" or "herd" for
+  ## explicit scripted baselines. Unknown values are rejected.
+  let cleaned = text.strip().toLowerAscii()
+  case cleaned
+  of "": skNone
+  of "gossip": skGossip
+  of "herd": skHerd
+  else:
+    raise newException(RumorError, "unknown PLAYER_SCRIPTED value: " & text)
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -138,6 +142,8 @@ proc newLlmClient*(config: GameConfig): LlmClient =
     result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
     result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
     result.curl = newCurly()
+    echo "rumor llm: sidecar transport, model ", result.model,
+      ", url ", result.sidecarEndpoint & "/v1/messages"
     return
   let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
   let bedrockToken = getEnv("AWS_BEARER_TOKEN_BEDROCK").strip()
@@ -164,7 +170,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "rumor llm: no LLM credentials; using scripted fallback"
+    echo "rumor llm: no LLM credentials configured (only explicit scripted seats can play)"
 
 proc spaceBatch(client: LlmClient) =
   ## The Bedrock sidecar caps an episode at 30 requests/minute. Ten seats
@@ -489,16 +495,32 @@ proc errorHead*(text: string, limit: int): string =
   if result.runeLen > limit:
     result = result.runeSubStr(0, limit) & "..."
 
+proc stripSingleFence(text: string): string =
+  ## Unwraps at most one outer Markdown code fence (``` or ```json).
+  result = text.strip()
+  if not result.startsWith("```") or not result.endsWith("```"):
+    return result
+  let firstNewline = result.find('\n')
+  if firstNewline < 0 or firstNewline >= result.len - 3:
+    return result
+  let header = result[3 ..< firstNewline].strip().toLowerAscii()
+  if header.len > 0 and header != "json":
+    return result
+  result = result[firstNewline + 1 ..< result.len - 3].strip()
+
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences.
-  let start = text.find('{')
-  let stop = text.rfind('}')
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model
-    ## sent instead of JSON (prose, a refusal, a cut-off analysis...).
-    raise newException(RumorError, "no JSON object in response: " &
+  ## Parses a JSON object response, accepting at most one outer Markdown fence.
+  let cleaned = stripSingleFence(text)
+  if cleaned.len == 0:
+    raise newException(RumorError, "empty model response")
+  try:
+    result = parseJson(cleaned)
+  except CatchableError:
+    raise newException(RumorError, "invalid JSON in response: " &
       errorHead(text, 160).replace("\n", " "))
-  parseJson(text[start .. stop])
+  if result.kind != JObject:
+    raise newException(RumorError, "response JSON must be an object: " &
+      errorHead(text, 160).replace("\n", " "))
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -579,79 +601,74 @@ proc oneLine(text: string): string =
   text.replace("\r\n", " ").replace('\n', ' ').replace('\r', ' ')
     .replace('\t', ' ')
 
-proc numberOr(node: JsonNode, fallback: int): int =
-  ## An integer, a float (rounded), or a numeric string; anything else is
-  ## the fallback — a nonsense confidence still lets the seat speak.
-  if node.isNil:
-    return fallback
-  case node.kind
-  of JInt: node.getInt()
-  of JFloat: int(round(node.getFloat()))
-  of JString:
-    try: int(round(parseFloat(node.getStr().strip())))
-    except ValueError: fallback
-  else: fallback
+proc readPercentInt(payload: JsonNode, field: string): int =
+  let node = payload{field}
+  if node.isNil or node.kind != JInt:
+    raise newException(RumorError, field & " must be an integer 0..100")
+  result = node.getInt()
+  if result < 0 or result > 100:
+    raise newException(RumorError, field & " out of range 0..100: " & $result)
 
-proc readClaim(sim: Sim, node: JsonNode): string =
-  ## Accepted spellings (case-insensitive, trimmed): A/a/the option-A word,
-  ## B/b/the option-B word; none/""/null/absent -> "none"; anything else
-  ## -> "none".
+proc readOptionalString(payload: JsonNode, field: string): string =
+  let node = payload{field}
   if node.isNil or node.kind == JNull:
-    return "none"
-  let raw =
-    if node.kind == JString: node.getStr().strip()
-    elif node.kind == JInt: $node.getInt()
-    else: ""
-  let text = raw.toLowerAscii()
-  if text.len == 0 or text == "none" or text == "null":
-    return "none"
-  if text == "a" or text == "1" or text == sim.optionA.toLowerAscii():
-    return "A"
-  if text == "b" or text == "2" or text == sim.optionB.toLowerAscii():
-    return "B"
-  "none"
+    return ""
+  if node.kind != JString:
+    raise newException(RumorError, field & " must be a string")
+  node.getStr()
 
 proc parseTalkReply*(sim: Sim, payload: JsonNode): Decision =
-  ## A talk reply is invalid — retry once, then take the scripted move —
-  ## only when it carries neither a usable claim nor a non-empty message.
-  ## Everything else degrades silently by clamping or dropping the field.
-  result.claim = sim.readClaim(payload{"claim"})
-  result.confidence = clamp(numberOr(payload{"confidence"}, 50), 0, 100)
-  let beliefNode = payload{"belief"}
-  let derived =
-    case result.claim
-    of "A": result.confidence
-    of "B": 100 - result.confidence
-    else: 50
-  result.belief = clamp(numberOr(beliefNode, derived), 0, 100)
-  result.message = cleanText(oneLine(payload{"message"}.getStr()),
-    MaxMessageLen)
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+  ## Strict canonical talk reply parser:
+  ## claim in {"A","B","none"}, confidence & belief integers 0..100,
+  ## message string (required non-empty if claim == "none"), optional notes string.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(RumorError, "talk reply must be a JSON object")
+  let claimNode = payload{"claim"}
+  if claimNode.isNil or claimNode.kind != JString:
+    raise newException(RumorError, "claim must be \"A\", \"B\", or \"none\"")
+  let claim = claimNode.getStr().strip()
+  if claim notin ["A", "B", "none"]:
+    raise newException(RumorError, "invalid claim: " & claim)
+  result.claim = claim
+  result.confidence = readPercentInt(payload, "confidence")
+  result.belief = readPercentInt(payload, "belief")
+  let msgNode = payload{"message"}
+  if msgNode.isNil or msgNode.kind != JString:
+    raise newException(RumorError, "message must be a string")
+  result.message = cleanText(oneLine(msgNode.getStr()), MaxMessageLen)
+  result.notes = cleanText(readOptionalString(payload, "notes"), MaxNotesLen)
   result.vote = result.claim
   if result.claim == "none" and result.message.len == 0:
     raise newException(RumorError,
       "a talk reply needs a claim or a message")
 
 proc parseVoteReply*(sim: Sim, payload: JsonNode): Decision =
-  ## `vote` is required; anything unparsable is invalid.
+  ## Strict canonical ballot reply parser:
+  ## vote in {"A","B"}, optional belief integer 0..100, optional reason/notes strings.
+  if payload.isNil or payload.kind != JObject:
+    raise newException(RumorError, "vote reply must be a JSON object")
   let node = payload{"vote"}
-  if node.isNil or node.kind == JNull:
-    raise newException(RumorError, "no vote in response")
-  let vote = sim.readClaim(node)
+  if node.isNil or node.kind != JString:
+    raise newException(RumorError, "vote must be \"A\" or \"B\"")
+  let vote = node.getStr().strip()
   if vote != "A" and vote != "B":
-    raise newException(RumorError, "vote is not A or B: " & $node)
+    raise newException(RumorError, "vote is not A or B: " & vote)
   result.vote = vote
   result.claim = vote
-  result.confidence = clamp(numberOr(payload{"confidence"}, 50), 0, 100)
-  let derived = if vote == "A": 75 else: 25
-  result.belief = clamp(numberOr(payload{"belief"}, derived), 0, 100)
-  result.reason = cleanText(oneLine(payload{"reason"}.getStr()), MaxReasonLen)
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesLen)
+  result.confidence = 50
+  let beliefNode = payload{"belief"}
+  if beliefNode.isNil or beliefNode.kind == JNull:
+    result.belief = if vote == "A": 75 else: 25
+  else:
+    result.belief = readPercentInt(payload, "belief")
+  result.reason = cleanText(oneLine(readOptionalString(payload, "reason")),
+    MaxReasonLen)
+  result.notes = cleanText(readOptionalString(payload, "notes"), MaxNotesLen)
 
 # ---- Batched decisions ------------------------------------------------------
 
 proc applyProbe(sim: Sim, seat: int, decision: Decision) =
-  ## Reject an illegal reply here so the retry carries the hint.
+  ## Validate legality against a snapshot before committing.
   var probe = sim
   if sim.phase == phBallot:
     probe.applyVote(seat, decision.vote, decision.belief, decision.reason,
@@ -660,6 +677,12 @@ proc applyProbe(sim: Sim, seat: int, decision: Decision) =
     probe.applyMessage(seat, decision.claim, decision.confidence,
       decision.belief, decision.message, decision.notes, false)
 
+proc raiseModelFailure(seat: int, message: string) {.noreturn.} =
+  var err = newException(ModelDecisionError,
+    "seat " & $seat & " model decision failed: " & message)
+  err.seat = seat
+  raise err
+
 proc decideAll*(
   client: LlmClient,
   sim: Sim,
@@ -667,63 +690,42 @@ proc decideAll*(
   prompts: seq[string],
   scripted: seq[ScriptKind]
 ): seq[Decision] =
-  ## One decision per seat in `seats`, in order. Never raises: any failure
-  ## falls back to the scripted baseline so the episode always advances.
-  ## `prompts` and `scripted` are indexed by SEAT.
-  ##
-  ## All the open seats go out as ONE parallel batch, because their
-  ## decisions are simultaneous by rule. A second, smaller batch retries
-  ## the invalid replies — but only when the turn's wall-clock budget still
-  ## has room for the rate-governor spacing plus a whole request timeout.
-  let turnStart = epochTime()
+  ## One decision per seat in `seats`, in order. Explicit scripted seats run
+  ## deterministically; model seats dispatch in one parallel batch. Any missing
+  ## endpoint, transport error, timeout, or invalid reply raises
+  ## ModelDecisionError with the failing seat instead of fabricating a move.
   let ballot = sim.phase == phBallot
   result = newSeq[Decision](seats.len)
-  var open: seq[int]     ## indexes into `seats` still undecided
+  var open: seq[int]     ## indexes into `seats` needing a model call
   for index, seat in seats:
     let kind = scripted[seat]
-    if kind != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if kind == skNone: skGossip else: kind))
+    if kind != skNone:
+      result[index] = scriptedAction(sim, seat, kind)
     else:
+      if client.disabled:
+        raiseModelFailure(seat, "no LLM endpoint or credentials configured")
       open.add(index)
-  for attempt in 0 .. 1:
-    if open.len == 0 or client.disabled:
-      break
-    if attempt > 0:
-      let elapsed = epochTime() - turnStart
-      if elapsed + MinBatchSpacingSeconds.float +
-          client.timeoutSeconds.float > TurnBudgetSeconds.float:
-        echo "rumor llm: turn budget spent after ", elapsed.int,
-          "s; the remaining seats take their scripted move"
-        break
+  if open.len == 0:
+    return
+  if client.transport == ltBedrock:
     client.spaceBatch()
-    var batch: RequestBatch
-    for index in open:
-      let seat = seats[index]
-      var user = sim.userPrompt(seat, prompts[seat])
-      if attempt > 0:
-        user.add("\nYour previous reply was invalid. Respond with ONLY " &
-          "the requested JSON object.")
-      let request = client.requestFor(systemPrompt(sim, seat), user, seat)
-      batch.post(request.url, request.headers, request.body, $index)
-    let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
-    var stillOpen: seq[int]
-    for position, index in open:
-      let seat = seats[index]
-      try:
-        let text = client.textOf(responses[position].response,
-          responses[position].error, batch[position].url)
-        let node = extractJsonObject(text)
-        let decision =
-          if ballot: sim.parseVoteReply(node) else: sim.parseTalkReply(node)
-        sim.applyProbe(seat, decision)
-        result[index] = decision
-      except CatchableError as error:
-        echo "rumor llm: seat ", seat, " attempt ", attempt, " failed: ",
-          error.msg
-        stillOpen.add(index)
-    open = stillOpen
+  var batch: RequestBatch
   for index in open:
     let seat = seats[index]
-    echo "rumor llm: seat ", seat, " falling back to scripted decision"
-    result[index] = scriptedAction(sim, seat, skGossip)
+    let user = sim.userPrompt(seat, prompts[seat])
+    let request = client.requestFor(systemPrompt(sim, seat), user, seat)
+    batch.post(request.url, request.headers, request.body, $index)
+  let responses = client.curl.makeRequests(batch, client.timeoutSeconds)
+  for position, index in open:
+    let seat = seats[index]
+    try:
+      let text = client.textOf(responses[position].response,
+        responses[position].error, batch[position].url)
+      let node = extractJsonObject(text)
+      let decision =
+        if ballot: sim.parseVoteReply(node) else: sim.parseTalkReply(node)
+      sim.applyProbe(seat, decision)
+      result[index] = decision
+    except CatchableError as error:
+      echo "rumor llm: seat ", seat, " failed: ", error.msg
+      raiseModelFailure(seat, error.msg)
