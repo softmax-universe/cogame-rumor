@@ -20,12 +20,8 @@ const
   ClueDrawAttempts* = 200
   MinSaboteurs* = 2
   MaxSaboteurs* = 3
-  ## Hard wall-clock ceiling for one turn (rate-governor spacing + batch +
-  ## an optional retry). Six turns of it fit inside the play budget.
+  ## Time allowance per turn when choosing rounds within the episode budget.
   TurnBudgetSeconds* = 80
-  ## The Bedrock sidecar caps an episode at 30 requests/minute; ten seats
-  ## per batch at this spacing is 23/minute.
-  MinBatchSpacingSeconds* = 26
   ## Share of the platform's episode timeout spent playing.
   PlayBudgetFraction* = 0.6
   ## Total spectator-pacing sleep an episode may spend, in milliseconds.

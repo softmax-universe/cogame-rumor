@@ -9,30 +9,18 @@
 ## model seat raises ModelDecisionError rather than fabricating a scripted
 ## move.
 ##
-## Credentials, in order of preference:
-##   COWORLD_LLM_ENDPOINT            - hosted sidecar
-##   Bedrock bearer token            - local play
-##   ANTHROPIC_API_KEY                - the key itself
-##   ANTHROPIC_API_KEY_URI            - a URI holding the key
+## The game sends model decisions to COWORLD_LLM_ENDPOINT.
 ## Explicit scripted seats (gossip / herd) run deterministically without any
 ## LLM call.
 
 import
-  std/[json, os, strutils, times, unicode],
-  bitworld/runtime,
+  std/[json, os, strutils, unicode],
   curly,
   crunchy,
   sim, prompts
 
 const
-  AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
-  BedrockAnthropicVersion = "bedrock-2023-05-31"
-  JsonOnlyClause = """
-
-OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no
-analysis, no explanation, no markdown fences, no text before or after
-the object. Your reply must begin with the character { and end with }."""
 
 type
   ModelDecisionError* = object of RumorError
@@ -53,24 +41,14 @@ type
     notes*: string      ## "" when the reply carried none
     scripted*: bool     ## the baseline decided this, not a model reply
 
-  LlmTransport = enum
-    ltNone, ltSidecar, ltBedrock, ltAnthropic
-
   LlmClient* = ref object
     curl: Curly
-    transport: LlmTransport
-    apiKey: string          ## anthropic transport
-    sidecarEndpoint: string
-    bedrockEndpoint: string ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
-    bedrockToken: string
-    model: string         ## direct-Anthropic transport only; Bedrock
-                          ## picks from bedrockModels instead
+    endpoint: string
+    model: string
     maxOutputTokens: int
     timeoutSeconds: int
-    lastBatchAt: float      ## epoch seconds of the previous dispatch
-    disabled*: bool   ## true once credentials are known-unavailable
+
+proc disabled*(client: LlmClient): bool = client.endpoint.len == 0
 
 proc parseScriptKind*(text: string): ScriptKind =
   ## PLAYER_SCRIPTED values: "" for model play, "gossip" or "herd" for
@@ -83,110 +61,15 @@ proc parseScriptKind*(text: string): ScriptKind =
   else:
     raise newException(RumorError, "unknown PLAYER_SCRIPTED value: " & text)
 
-proc resolveApiKey(): string =
-  result = getEnv("ANTHROPIC_API_KEY").strip()
-  if result.len > 0:
-    return
-  let uri = getEnv("ANTHROPIC_API_KEY_URI").strip()
-  if uri.len == 0:
-    return ""
-  try:
-    result = readCogameUri(uri, "ANTHROPIC_API_KEY_URI").strip()
-  except CatchableError as error:
-    echo "rumor llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
-    result = ""
-
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another.
-  ## The config "model" field is NOT consulted here: it applies to
-  ## the direct-Anthropic transport only, and the haiku-first
-  ## ordering is a shared-capacity decision that trumps per-game
-  ## preference.
-  let pinned = getEnv("BEDROCK_MODEL").strip()
-  if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "rumor llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
-
-proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
-
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
-    model: config.model,
+    endpoint: getEnv("COWORLD_LLM_ENDPOINT").strip().strip(chars = {'/'}, leading = false),
+    model: getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5"),
     maxOutputTokens: config.maxOutputTokens,
     timeoutSeconds: config.llmTimeoutSeconds
   )
-  let sidecarEndpoint = getEnv("COWORLD_LLM_ENDPOINT").strip()
-  if sidecarEndpoint.len > 0:
-    result.transport = ltSidecar
-    result.sidecarEndpoint = sidecarEndpoint.strip(chars = {'/'}, leading = false)
-    result.model = getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5")
+  if not result.disabled:
     result.curl = newCurly()
-    echo "rumor llm: sidecar transport, model ", result.model,
-      ", url ", result.sidecarEndpoint & "/v1/messages"
-    return
-  let bedrockEndpoint = getEnv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").strip()
-  let bedrockToken = getEnv("AWS_BEARER_TOKEN_BEDROCK").strip()
-  if bedrockEndpoint.len > 0 or bedrockToken.len > 0:
-    let region = getEnv("AWS_REGION",
-      getEnv("AWS_DEFAULT_REGION", "us-west-2"))
-    let endpoint =
-      if bedrockEndpoint.len > 0: bedrockEndpoint
-      else: "https://bedrock-runtime." & region & ".amazonaws.com"
-    result.transport = ltBedrock
-    result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
-    result.bedrockToken = bedrockToken
-    result.curl = newCurly()
-    echo "rumor llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel],
-      ", url ", result.bedrockUrl
-    return
-  result.apiKey = resolveApiKey()
-  if result.apiKey.len > 0:
-    result.transport = ltAnthropic
-    result.curl = newCurly()
-    echo "rumor llm: anthropic transport, model ", result.model
-  else:
-    result.transport = ltNone
-    result.disabled = true
-    echo "rumor llm: no LLM credentials configured (only explicit scripted seats can play)"
-
-proc spaceBatch(client: LlmClient) =
-  ## The Bedrock sidecar caps an episode at 30 requests/minute. Ten seats
-  ## per batch would breach that the moment turns run faster than 20 s, and
-  ## a throttle cascades into scripted fallbacks — so hold the floor at
-  ## MinBatchSpacingSeconds (23 requests/minute with margin). Only batches
-  ## that are actually dispatched wait, so a credential-less run never
-  ## sleeps.
-  if client.lastBatchAt <= 0.0:
-    client.lastBatchAt = epochTime()
-    return
-  let wait = client.lastBatchAt + MinBatchSpacingSeconds.float - epochTime()
-  if wait > 0.0:
-    echo "rumor llm: rate governor holding ", wait.int, "s before the batch"
-    sleep(int(wait * 1000.0))
-  client.lastBatchAt = epochTime()
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -393,8 +276,7 @@ proc systemPrompt*(sim: Sim, seat: int): string =
       "+ 0.4 × whether YOUR OWN vote is right. Both are in the range −1 " &
       "to +1. Getting the network right is worth more than being right " &
       "alone.\n" &
-      "- Your notes are private and are fed back to you every round.\n" &
-      JsonOnlyClause
+      "- Your notes are private and are fed back to you every round.\n"
   else:
     var crew: seq[int]
     for other in sim.saboteurSeats:
@@ -423,8 +305,7 @@ proc systemPrompt*(sim: Sim, seat: int): string =
       "- A claim nobody can corroborate is a claim that gets you caught. " &
       "Fabricated counts, borrowed names, and agreeing loudly with a real " &
       "cog all work better than shouting.\n" &
-      "- Your notes are private and are fed back to you every round.\n" &
-      JsonOnlyClause
+      "- Your notes are private and are fed back to you every round.\n"
 
 
 proc operatorBlock(prompt: string): string =
@@ -472,20 +353,20 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
   if ballot:
-    result.add("Reply with ONLY {\"vote\": \"A\", \"belief\": 70, " &
+    result.add("Reply with a JSON object like {\"vote\": \"A\", \"belief\": 70, " &
       "\"reason\": \"…\", \"notes\": \"…\"} — vote is \"A\" (" &
       sim.optionA & ") or \"B\" (" & sim.optionB & "); belief 0-100; " &
       "reason at most " & $MaxReasonLen & " characters; notes at most " &
       $MaxNotesLen & " characters.")
   else:
-    result.add("Reply with ONLY {\"claim\": \"A\", \"confidence\": 70, " &
+    result.add("Reply with a JSON object like {\"claim\": \"A\", \"confidence\": 70, " &
       "\"belief\": 70, \"message\": \"…\", \"notes\": \"…\"} — claim is " &
       "\"A\" (" & sim.optionA & "), \"B\" (" & sim.optionB & ") or " &
       "\"none\"; confidence and belief 0-100; message at most " &
       $MaxMessageLen & " characters (or \"\"); notes at most " &
       $MaxNotesLen & " characters.")
 
-# ---- Anthropic / Bedrock transport ------------------------------------------
+# ---- Hosted model transport ------------------------------------------
 
 proc errorHead*(text: string, limit: int): string =
   ## The head of a captured error or reply body, cut on a RUNE boundary: a
@@ -524,58 +405,22 @@ proc extractJsonObject*(text: string): JsonNode =
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
-  var body = %*{
+  result.url = client.endpoint & "/v1/messages"
+  result.headers["content-type"] = "application/json"
+  result.headers["anthropic-version"] = AnthropicVersion
+  result.headers["X-Coworld-Player-Slot"] = $slot
+  result.body = $ %*{
+    "model": client.model,
     "max_tokens": client.maxOutputTokens,
     "system": system,
     "messages": [{"role": "user", "content": user}]
   }
-  var headers: HttpHeaders
-  if client.transport == ltSidecar and slot >= 0:
-    headers["X-Coworld-Player-Slot"] = $slot
-  headers["content-type"] = "application/json"
-  if client.transport == ltBedrock:
-    body["anthropic_version"] = %BedrockAnthropicVersion
-    if client.bedrockToken.len > 0:
-      headers["authorization"] = "Bearer " & client.bedrockToken
-    result.url = client.bedrockUrl()
-  elif client.transport == ltSidecar:
-    body["model"] = %client.model
-    headers["anthropic-version"] = AnthropicVersion
-    result.url = client.sidecarEndpoint & "/v1/messages"
-  else:
-    body["model"] = %client.model
-    ## Only the Claude 5 / Opus tiers accept an effort setting; Haiku 4.5
-    ## rejects the whole request with a 400 if it is present.
-    if "haiku" notin client.model and "4-5" notin client.model:
-      body["output_config"] = %*{"effort": "low"}
-    headers["x-api-key"] = client.apiKey
-    headers["anthropic-version"] = AnthropicVersion
-    result.url = AnthropicUrl
-  result.headers = headers
-  result.body = $body
 
-proc textOf(client: LlmClient, response: Response, error, url: string):
-    string =
-  ## The text of one batched reply, or a RumorError describing why there is
-  ## none. Auth failures disable the client; model-access and throttle
-  ## failures rotate the Bedrock model for the next batch.
+proc textOf(response: Response, error: string): string =
   if error.len > 0:
     raise newException(RumorError, "llm transport: " & error)
-  if response.code == 401 or response.code == 403:
-    let detail = errorHead(response.body, 400)
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(RumorError,
-        "bedrock model access denied: " & detail)
-    client.disabled = true
-    raise newException(RumorError,
-      "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
-  if response.code == 429:
-    let detail = errorHead(response.body, 300)
-    discard client.tryNextBedrockModel("throttled")
-    raise newException(RumorError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
-    raise newException(RumorError, "anthropic error " & $response.code &
+    raise newException(RumorError, "llm HTTP " & $response.code &
       ": " & errorHead(response.body, 300))
   let payload = parseJson(response.body)
   if payload{"stop_reason"}.getStr() == "refusal":
@@ -703,12 +548,10 @@ proc decideAll*(
       result[index] = scriptedAction(sim, seat, kind)
     else:
       if client.disabled:
-        raiseModelFailure(seat, "no LLM endpoint or credentials configured")
+        raiseModelFailure(seat, "COWORLD_LLM_ENDPOINT is not set")
       open.add(index)
   if open.len == 0:
     return
-  if client.transport == ltBedrock:
-    client.spaceBatch()
   var batch: RequestBatch
   for index in open:
     let seat = seats[index]
@@ -719,8 +562,7 @@ proc decideAll*(
   for position, index in open:
     let seat = seats[index]
     try:
-      let text = client.textOf(responses[position].response,
-        responses[position].error, batch[position].url)
+      let text = textOf(responses[position].response, responses[position].error)
       let node = extractJsonObject(text)
       let decision =
         if ballot: sim.parseVoteReply(node) else: sim.parseTalkReply(node)

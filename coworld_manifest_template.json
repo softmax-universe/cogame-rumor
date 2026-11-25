@@ -24,7 +24,10 @@
       "run": [
         "/bin/rumor"
       ],
-      "env": {},
+      "env": {
+        "COWORLD_LLM_ENABLED": "true",
+        "COWORLD_LLM_MODEL": "anthropic/claude-haiku-4.5"
+      },
       "source_url": "https://github.com/softmax-universe/cogame-rumor/tree/main"
     },
     "config_schema": {
@@ -114,11 +117,6 @@
           "maximum": 10000,
           "default": 400
         },
-        "model": {
-          "description": "Claude model for the direct-Anthropic transport (ANTHROPIC_API_KEY). Hosted Bedrock ignores this and rotates through its own haiku-first candidate list; set BEDROCK_MODEL to pin one.",
-          "type": "string",
-          "default": "claude-sonnet-5"
-        },
         "maxOutputTokens": {
           "type": "integer",
           "minimum": 64,
@@ -129,7 +127,7 @@
           "type": "integer",
           "minimum": 5,
           "maximum": 300,
-          "default": 25
+          "default": 60
         },
         "player_connect_timeout_seconds": {
           "type": "number",

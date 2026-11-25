@@ -70,8 +70,8 @@ and scored.
 - `src/rumor/sim.nim` — pure rules: the seeded scenario (proposition, truth,
   roles, graph, clues), message routing, the sealed ballot, the tally,
   scoring, replay derivation; shared by server, tests and the wasm viewer
-- `src/rumor/llm.nim` — Claude client (one parallel batch per turn, a
-  26 s rate governor, an 80 s hard turn budget) + the scripted baselines
+- `src/rumor/llm.nim` — native sidecar client (one parallel batch per turn, a
+  60 s default inference deadline) + the scripted baselines
 - `src/rumor/server.nim` — mummy HTTP/WS server (player, global, replay)
 - `src/rumor_player.nim` — prompt, scripted, or external-action player
 - `client/` — shared canvas renderer + global/player/replay pages (the
@@ -112,8 +112,7 @@ tools/local_episode.sh 7
 # in dist/smoke/), exactly what CI runs:
 docker build --platform=linux/amd64 -t coworld-rumor:ci .
 ./tools/ci/docker_smoke.sh coworld-rumor:ci
-# Export ANTHROPIC_API_KEY for real Claude play; omit for the scripted
-# baselines.
+# Model play uses the game container’s COWORLD_LLM_ENDPOINT and COWORLD_LLM_MODEL.
 ```
 
 The normal prompt, gossip, and herd manifest passed all ten local Coworld
@@ -125,12 +124,10 @@ Coworld packaging (from a metta checkout):
 uv run coworld build --project <this dir> --version 0.1.x
 uv run coworld certify <this dir>/dist/coworld_manifest.json
 uv run coworld upload-coworld <this dir>/dist/coworld_manifest.json
-uv run coworld secret put rumor anthropic_api_key <keyfile>   # hosted Claude
 ```
 
 In CI, `.github/workflows/coworld-release.yml` does all of that in the
-load-bearing order (build → certify → upload policies → upload-coworld →
-secret put) and uploads a `release-result` artifact.
+load-bearing order (build → certify → upload policies → upload-coworld) and uploads a `release-result` artifact.
 
 ## Fielding a policy
 
