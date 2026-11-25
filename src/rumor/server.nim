@@ -50,8 +50,10 @@ type
     prompts: seq[string]
     scripted: seq[ScriptKind]
     external: seq[bool]
+    registered: seq[bool]
     decisionId: int
     pendingActions: seq[JsonNode]
+    externalErrors: seq[string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -219,6 +221,35 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "rumor: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(runtimeConfig: RuntimeConfig, failedSeat: int,
+    message: string) {.noreturn.} =
+  ## Terminal policy failure: write Coworld's GamePlayerFailure artifact,
+  ## omit results.json and replay.json so no scores or fabricated moves are
+  ## published, and exit non-zero.
+  var shouldWrite = false
+  withLock stateLock:
+    if not state.finished:
+      state.finished = true
+      shouldWrite = true
+  let cleanMsg = errorHead(message, 1000)
+  echo "rumor: failing episode at seat ", failedSeat, ": ", cleanMsg
+  if shouldWrite:
+    let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+    if failureUri.len > 0:
+      let payload = $ %*{
+        "failed_policy_index": failedSeat,
+        "message": cleanMsg
+      }
+      try:
+        writeArtifact(
+          failureUri, payload, "application/json",
+          "COGAME_PLAYER_FAILURE_METHOD"
+        )
+      except CatchableError as error:
+        echo "rumor: failed to write player failure artifact: ", error.msg
+  sleep(500)
+  quit(1)
+
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
   {.gcsafe.}:
     let config = state.config
@@ -226,18 +257,33 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     let deadline = gameStart + config.playerConnectTimeoutSeconds
 
     while epochTime() < deadline:
-      var allConnected = false
+      var allReady = false
       withLock stateLock:
-        allConnected = state.playerSockets.len >= config.tokens.len
-      if allConnected:
+        allReady = state.playerSockets.len >= config.tokens.len
+        if allReady:
+          for slot in 0 ..< config.tokens.len:
+            if not state.registered[slot]:
+              allReady = false
+              break
+      if allReady:
         break
-      sleep(200)
+      sleep(100)
 
+    var missingSlot = -1
     withLock stateLock:
-      state.started = true
-      echo "rumor: starting with ", state.playerSockets.len, "/",
-        config.tokens.len, " players connected"
-      state.broadcastLocked()
+      for slot in 0 ..< config.tokens.len:
+        if not state.playerSockets.hasKey(slot) or not state.registered[slot]:
+          missingSlot = slot
+          break
+      if missingSlot < 0:
+        state.started = true
+        echo "rumor: starting with ", state.playerSockets.len, "/",
+          config.tokens.len, " players connected and registered"
+        state.broadcastLocked()
+    if missingSlot >= 0:
+      failEpisode(runtimeConfig, missingSlot,
+        "player slot " & $missingSlot &
+        " did not connect and register before timeout")
 
     let client = newLlmClient(config)
 
@@ -270,79 +316,109 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var external: seq[bool]
       var decisionId: int
       var ballot = false
+      var deadlineFailedSeat = -1
       withLock stateLock:
         if state.sim.done:
           break
-        ## Checked BEFORE the batch, never mid-turn: past the deadline the
-        ## ballot is forced, the table is tallied and unmasked, and the
-        ## episode settles with reason "deadline". A short honest episode
-        ## always beats a long one that never lands.
         if playDeadline > 0.0 and epochTime() > playDeadline:
-          echo "rumor: episode deadline reached in round ",
-            state.sim.round, "/", config.rounds, "; calling the vote early"
-          state.sim.forceBallot()
-          state.broadcastLocked()
-          break
-        seats = state.sim.pendingSeats()
-        simCopy = state.sim
-        prompts = state.prompts
-        scripted = state.scripted
-        external = state.external
-        inc state.decisionId
-        decisionId = state.decisionId
-        state.pendingActions = newSeq[JsonNode](config.players.len)
-        for seat in seats:
-          if external[seat] and state.playerSockets.hasKey(seat):
-            state.playerSockets[seat].send($ %*{
-              "type": "observation", "id": decisionId,
-              "observation": state.playerFrameJson(seat)})
-        ballot = state.sim.phase == phBallot
-        echo "rumor: ", (if ballot: "sealed vote" else:
-            "round " & $(state.sim.round + 1) & " of " & $config.rounds),
-          " at ", (epochTime() - gameStart).int, "s"
-
-      ## The slow part (Claude, ONE parallel batch of ten) runs outside the
-      ## lock on a snapshot; only this thread mutates the sim, so the
-      ## snapshot cannot go stale.
-      var modelKinds = newSeq[ScriptKind](scripted.len)
-      for seat in 0 ..< scripted.len:
-        modelKinds[seat] = scripted[seat]
-      for seat in seats:
-        if external[seat]:
-          modelKinds[seat] = skGossip
-      var decisions = client.decideAll(simCopy, seats, prompts, modelKinds)
-      let deadline = epochTime() + config.llmTimeoutSeconds.float
-      while epochTime() < deadline:
-        var ready = true
-        withLock stateLock:
+          for seat in state.sim.pendingSeats():
+            if state.scripted[seat] == skNone:
+              deadlineFailedSeat = seat
+              break
+          if deadlineFailedSeat < 0:
+            echo "rumor: episode deadline reached in round ",
+              state.sim.round, "/", config.rounds, "; calling the vote early"
+            state.sim.forceBallot()
+            state.broadcastLocked()
+            break
+        if deadlineFailedSeat < 0:
+          seats = state.sim.pendingSeats()
+          simCopy = state.sim
+          prompts = state.prompts
+          scripted = state.scripted
+          external = state.external
+          inc state.decisionId
+          decisionId = state.decisionId
+          state.pendingActions = newSeq[JsonNode](config.players.len)
+          state.externalErrors = newSeq[string](config.players.len)
           for seat in seats:
-            if external[seat] and state.playerSockets.hasKey(seat) and
-                state.pendingActions[seat].isNil:
-              ready = false
-        if ready:
-          break
-        sleep(20)
+            if external[seat] and state.playerSockets.hasKey(seat):
+              state.playerSockets[seat].send($ %*{
+                "type": "observation", "id": decisionId,
+                "observation": state.playerFrameJson(seat)})
+          ballot = state.sim.phase == phBallot
+          echo "rumor: ", (if ballot: "sealed vote" else:
+              "round " & $(state.sim.round + 1) & " of " & $config.rounds),
+            " at ", (epochTime() - gameStart).int, "s"
+      if deadlineFailedSeat >= 0:
+        failEpisode(runtimeConfig, deadlineFailedSeat,
+          "episode play deadline reached before completion")
+
+      ## Partition into non-external (scripted + model) and external seats.
+      var nonExternalSeats: seq[int]
+      var nonExternalPositions: seq[int]
+      var hasExternal = false
       for index, seat in seats:
         if external[seat]:
-          var action: JsonNode
-          withLock stateLock:
-            action = state.pendingActions[seat]
-          if not action.isNil:
-            decisions[index] =
-              if ballot: simCopy.parseVoteReply(action)
-              else: simCopy.parseTalkReply(action)
+          hasExternal = true
+        else:
+          nonExternalSeats.add(seat)
+          nonExternalPositions.add(index)
 
+      var decisions = newSeq[Decision](seats.len)
+      if nonExternalSeats.len > 0:
+        var batchDecisions: seq[Decision]
+        try:
+          batchDecisions = client.decideAll(simCopy, nonExternalSeats, prompts,
+            scripted)
+        except ModelDecisionError as error:
+          failEpisode(runtimeConfig, error.seat, error.msg)
+        for pos, index in nonExternalPositions:
+          decisions[index] = batchDecisions[pos]
+
+      if hasExternal:
+        let extDeadline = epochTime() + config.llmTimeoutSeconds.float
+        while epochTime() < extDeadline:
+          var ready = true
+          withLock stateLock:
+            for seat in seats:
+              if external[seat] and state.playerSockets.hasKey(seat) and
+                  state.pendingActions[seat].isNil and
+                  state.externalErrors[seat].len == 0:
+                ready = false
+          if ready:
+            break
+          sleep(20)
+        for index, seat in seats:
+          if external[seat]:
+            var action: JsonNode
+            var extErr: string
+            withLock stateLock:
+              action = state.pendingActions[seat]
+              extErr = state.externalErrors[seat]
+            if extErr.len > 0:
+              failEpisode(runtimeConfig, seat,
+                "seat " & $seat & " external action invalid: " & extErr)
+            if action.isNil:
+              failEpisode(runtimeConfig, seat,
+                "seat " & $seat & " external action timed out")
+            try:
+              decisions[index] =
+                if ballot: simCopy.parseVoteReply(action)
+                else: simCopy.parseTalkReply(action)
+            except CatchableError as error:
+              failEpisode(runtimeConfig, seat,
+                "seat " & $seat & " external action invalid: " & error.msg)
+
+      var applyFailedSeat = -1
+      var applyFailedMsg = ""
       withLock stateLock:
         ## Applied in ascending seat order — deterministic, and the order
         ## cannot matter because nothing a seat does this round is visible
         ## to any other seat this round.
         for index, seat in seats:
           let decision = decisions[index]
-          ## Provenance comes from the decision itself, so a seat whose LLM
-          ## reply failed and fell back to the baseline is recorded as
-          ## scripted too, not just a seat registered as one.
-          let wasScripted = decision.scripted or
-            scripted[seat] != skNone or decision.scripted
+          let wasScripted = scripted[seat] != skNone
           try:
             if ballot:
               state.sim.applyVote(seat, decision.vote, decision.belief,
@@ -352,27 +428,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
                 decision.confidence, decision.belief, decision.message,
                 decision.notes, wasScripted)
           except RumorError as error:
-            echo "rumor: reply rejected (", error.msg,
-              "); using scripted fallback"
-            ## The fallback is applied inside its own guard: it is
-            ## unreachable after the pre-checks, but if it ever did raise
-            ## (the seat has already acted this turn) the escape would kill
-            ## the game thread while mummy kept serving. Skipping the seat
-            ## costs at most one turn; the play deadline still bounds the
-            ## episode.
-            try:
-              let fallback = scriptedAction(state.sim, seat, skGossip)
-              if ballot:
-                state.sim.applyVote(seat, fallback.vote, fallback.belief,
-                  "", "", true)
-              else:
-                state.sim.applyMessage(seat, fallback.claim,
-                  fallback.confidence, fallback.belief, fallback.message,
-                  "", true)
-            except RumorError as fallbackError:
-              echo "rumor: scripted fallback rejected for seat ", seat,
-                " (", fallbackError.msg, "); skipping the seat"
-        state.broadcastLocked()
+            applyFailedSeat = seat
+            applyFailedMsg = "seat " & $seat & " action rejected: " & error.msg
+            break
+        if applyFailedSeat < 0:
+          state.broadcastLocked()
+      if applyFailedSeat >= 0:
+        failEpisode(runtimeConfig, applyFailedSeat, applyFailedMsg)
 
       ## Pace between turns so spectators can read the graph.
       if config.turnDelayMs > 0:
@@ -504,25 +566,32 @@ proc websocketHandler(
             raise newException(RumorError, "unknown player control")
           withLock stateLock:
             state.external[slot] = true
+            state.registered[slot] = true
           return
         if payload{"type"}.getStr() == "action":
           withLock stateLock:
             if state.external[slot] and payload["id"].getInt() ==
-                state.decisionId and state.pendingActions[slot].isNil:
-              let action = payload["action"]
-              let decision =
+                state.decisionId and state.pendingActions[slot].isNil and
+                state.externalErrors[slot].len == 0:
+              try:
+                let action = payload["action"]
+                let decision =
+                  if state.sim.phase == phBallot:
+                    state.sim.parseVoteReply(action)
+                  else:
+                    state.sim.parseTalkReply(action)
+                var probe = state.sim
                 if state.sim.phase == phBallot:
-                  state.sim.parseVoteReply(action)
+                  probe.applyVote(slot, decision.vote, decision.belief,
+                    decision.reason, decision.notes, false)
                 else:
-                  state.sim.parseTalkReply(action)
-              var probe = state.sim
-              if state.sim.phase == phBallot:
-                probe.applyVote(slot, decision.vote, decision.belief,
-                  decision.reason, decision.notes, false)
-              else:
-                probe.applyMessage(slot, decision.claim, decision.confidence,
-                  decision.belief, decision.message, decision.notes, false)
-              state.pendingActions[slot] = action
+                  probe.applyMessage(slot, decision.claim, decision.confidence,
+                    decision.belief, decision.message, decision.notes, false)
+                state.pendingActions[slot] = action
+              except CatchableError as error:
+                state.externalErrors[slot] = error.msg
+                echo "rumor: slot ", slot, " external action rejected: ",
+                  error.msg
           return
         if payload{"type"}.getStr() == "prompt":
           var prompt = payload{"prompt"}.getStr()
@@ -530,14 +599,15 @@ proc websocketHandler(
             prompt = prompt.runeSubStr(0, MaxPromptLen)
           let node = payload{"scripted"}
           let scripted =
-            if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skGossip
-              else: skNone)
-            else: parseScriptKind(node.getStr())
+            if node.isNil or node.kind == JNull: skNone
+            elif node.kind == JString: parseScriptKind(node.getStr())
+            else:
+              raise newException(RumorError, "scripted field must be a string")
           withLock stateLock:
             state.prompts[slot] = prompt
             state.scripted[slot] = scripted
             state.external[slot] = false
+            state.registered[slot] = true
           echo "rumor: slot ", slot, " delivered a prompt (",
             prompt.len, " chars",
             (if scripted != skNone: ", scripted " & $scripted else: ""), ")"
@@ -612,7 +682,9 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.prompts = newSeq[string](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
   state.external = newSeq[bool](config.players.len)
+  state.registered = newSeq[bool](config.players.len)
   state.pendingActions = newSeq[JsonNode](config.players.len)
+  state.externalErrors = newSeq[string](config.players.len)
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)

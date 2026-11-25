@@ -41,9 +41,14 @@ when isMainModule:
   let url = getEnv("COWORLD_PLAYER_WS_URL")
   if url.len == 0:
     quit("COWORLD_PLAYER_WS_URL is not set", 1)
-  let scripted = getEnv("PLAYER_SCRIPTED").strip()
-  var prompt = getEnv("PLAYER_PROMPT")
-  if prompt.len == 0:
+  let scripted = getEnv("PLAYER_SCRIPTED").strip().toLowerAscii()
+  if scripted notin ["", "gossip", "herd"]:
+    quit("unknown PLAYER_SCRIPTED value: " & scripted &
+      " (expected empty, gossip, or herd)", 1)
+  var prompt =
+    if scripted.len > 0: ""
+    else: getEnv("PLAYER_PROMPT")
+  if scripted.len == 0 and prompt.len == 0:
     prompt = DefaultPrompt
 
   proc promptFrame(): string =
@@ -51,9 +56,6 @@ when isMainModule:
 
   echo "rumor player: connecting to game"
   let socket = newWebSocket(url)
-  socket.send(promptFrame())
-  echo "rumor player: prompt delivered (", prompt.len, " chars",
-    (if scripted.len > 0: ", scripted " & scripted else: ""), ")"
 
   ## whisky's receiveMessage RAISES on a close frame, and the game's
   ## quit(0) can outrun the flushed final frame — so a dead socket is a
@@ -94,9 +96,10 @@ when isMainModule:
           echo "rumor player: seated at slot ",
             payload{"slot"}.getInt(), " as ", payload{"name"}.getStr(),
             " (", payload{"role"}.getStr(), ")"
-          ## Re-deliver the prompt after the welcome, in case the first
-          ## send raced the server's slot registration.
           socket.send(promptFrame())
+          echo "rumor player: registered (",
+            (if scripted.len > 0: "scripted " & scripted
+             else: "prompt " & $prompt.len & " chars"), ")"
         of "final":
           echo "rumor player: final scores ", payload{"scores"}
           break

@@ -66,7 +66,13 @@ network="${prefix}-net"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/${slug}-smoke.XXXXXX")"
 seats=0
 
+stub_pid=""
+stub_log="${work_dir}/llm_stub.jsonl"
+
 cleanup() {
+  if [ -n "${stub_pid}" ]; then
+    kill "${stub_pid}" >/dev/null 2>&1 || true
+  fi
   docker ps -aq --filter "name=${prefix}" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker network rm "${network}" >/dev/null 2>&1 || true
   rm -rf "${work_dir}"
@@ -191,11 +197,75 @@ chmod 777 "${work_dir}"
 docker network create "${network}" >/dev/null
 
 game_env=()
-if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+used_local_stub=0
+if [ -n "${COWORLD_LLM_ENDPOINT:-}" ]; then
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=${COWORLD_LLM_ENDPOINT}")
+  if [ -n "${COWORLD_LLM_MODEL:-}" ]; then
+    game_env+=(-e "COWORLD_LLM_MODEL=${COWORLD_LLM_MODEL}")
+  fi
+  echo "COWORLD_LLM_ENDPOINT present: using caller sidecar endpoint"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   game_env+=(-e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
-  echo "ANTHROPIC_API_KEY present: the LLM path will be exercised"
+  echo "ANTHROPIC_API_KEY present: the direct Anthropic LLM path will be exercised"
 else
-  echo "no ANTHROPIC_API_KEY: the game must complete on its scripted baselines"
+  # Test-only local HTTP fixture for credential-free CI smoke: serves
+  # canonical Rumor JSON on /v1/messages and logs every seat call.
+  stub_port_file="${work_dir}/stub_port"
+  python3 - "${stub_port_file}" "${stub_log}" <<'PY' &
+import http.server
+import json
+import sys
+from pathlib import Path
+
+port_file = Path(sys.argv[1])
+log_file = Path(sys.argv[2])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        return
+
+    def do_POST(self):
+        if self.path != "/v1/messages":
+            self.send_response(404)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        slot = self.headers.get("X-Coworld-Player-Slot", "")
+        messages = body.get("messages") or []
+        user_text = messages[0].get("content", "") if messages else ""
+        is_ballot = "SEALED VOTE" in user_text
+        if is_ballot:
+            reply = json.dumps({"vote": "A", "belief": 70, "reason": "smoke ballot", "notes": ""})
+        else:
+            reply = json.dumps({"claim": "A", "confidence": 70, "belief": 70, "message": "smoke report", "notes": ""})
+        with log_file.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"slot": slot, "ballot": is_ballot, "model": body.get("model")}) + "\n")
+        payload = json.dumps({"content": [{"type": "text", "text": reply}], "stop_reason": "end_turn"}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), Handler)
+port_file.write_text(str(server.server_address[1]), encoding="utf-8")
+server.serve_forever()
+PY
+  stub_pid="$!"
+  for _ in $(seq 1 50); do
+    if [ -s "${stub_port_file}" ]; then
+      break
+    fi
+    sleep 0.1
+  done
+  test -s "${stub_port_file}" || { echo "FAIL: local LLM smoke stub did not start" >&2; exit 1; }
+  stub_port="$(cat "${stub_port_file}")"
+  used_local_stub=1
+  game_env+=(--add-host=host.docker.internal:host-gateway)
+  game_env+=(-e "COWORLD_LLM_ENDPOINT=http://host.docker.internal:${stub_port}")
+  game_env+=(-e "COWORLD_LLM_MODEL=anthropic/claude-haiku-4.5")
+  echo "started test-only local HTTP LLM stub on port ${stub_port}"
 fi
 
 echo "starting game container (${image} ${game_bin}) ..."
@@ -244,7 +314,7 @@ fi
 # --------------------------------------------------------------------------
 # Assert the artifacts.
 # --------------------------------------------------------------------------
-if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" <<'PY'
+if ! python3 - "${work_dir}" "${seats}" "${require_replay_json}" "${used_local_stub}" "${manifest}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -252,6 +322,8 @@ from pathlib import Path
 work = Path(sys.argv[1])
 seats = int(sys.argv[2])
 require_replay_json = sys.argv[3] not in ("0", "", "false", "no")
+used_local_stub = sys.argv[4] == "1"
+manifest = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
 
 failure = work / "player_failure.json"
 if failure.exists():
@@ -290,6 +362,25 @@ if require_replay_json:
             f"replay is not valid UTF-8 JSON: {exc} "
             "(set SMOKE_REQUIRE_REPLAY_JSON=0 for a binary replay format)"
         ) from exc
+
+if used_local_stub:
+    stub_log = work / "llm_stub.jsonl"
+    if not stub_log.exists():
+        raise SystemExit("local LLM stub recorded zero calls")
+    calls = [json.loads(line) for line in stub_log.read_text(encoding="utf-8").splitlines() if line.strip()]
+    by_id = {p["id"]: p for p in manifest.get("player") or []}
+    cert_players = manifest.get("certification", {}).get("players") or []
+    expected_model_slots = {
+        str(idx)
+        for idx, seat in enumerate(cert_players)
+        if not (by_id.get(seat.get("player_id"), {}).get("env") or {}).get("PLAYER_SCRIPTED")
+    }
+    observed_slots = {str(call.get("slot")) for call in calls}
+    if observed_slots != expected_model_slots:
+        raise SystemExit(
+            f"stub LLM slots mismatch: observed={sorted(observed_slots)} expected={sorted(expected_model_slots)}"
+        )
+    print(f"local LLM stub verified: {len(calls)} calls across model slots {sorted(observed_slots)}")
 
 print(
     f"smoke OK: seats={seats} results={results_path.stat().st_size}B "
