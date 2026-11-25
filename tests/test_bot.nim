@@ -314,10 +314,19 @@ suite "prompts":
     while sim.phase != phBallot:
       for seat in sim.pendingSeats():
         sim.applyMessage(seat, "A", 60, 60, "hello", "", true)
+    let system = sim.systemPrompt(0)
     let user = sim.userPrompt(0, "")
+    check "Reply with ONLY one JSON object" in system
     check "SEALED VOTE" in user
+    check "Reply with ONLY a single JSON object" in user
     check "\"vote\"" in user
     check "\"claim\"" notin user
+
+  test "talk prompts instruct JSON-only replies with private reasoning in notes":
+    let sim = initSim(fixture(7, rounds = 3))
+    for seat in 0 ..< Seats:
+      check "Reply with ONLY one JSON object" in sim.systemPrompt(seat)
+      check "Reply with ONLY a single JSON object" in sim.userPrompt(seat, "")
 
 suite "model transport failure":
   test "a dead transport raises ModelDecisionError immediately without fallback":

@@ -62,9 +62,10 @@ proc parseScriptKind*(text: string): ScriptKind =
     raise newException(RumorError, "unknown PLAYER_SCRIPTED value: " & text)
 
 proc newLlmClient*(config: GameConfig): LlmClient =
+  let envModel = getEnv("COWORLD_LLM_MODEL").strip()
   result = LlmClient(
     endpoint: getEnv("COWORLD_LLM_ENDPOINT").strip().strip(chars = {'/'}, leading = false),
-    model: getEnv("COWORLD_LLM_MODEL", "anthropic/claude-haiku-4.5"),
+    model: if envModel.len > 0: envModel else: "anthropic/claude-haiku-4.5",
     maxOutputTokens: config.maxOutputTokens,
     timeoutSeconds: config.llmTimeoutSeconds
   )
@@ -276,7 +277,8 @@ proc systemPrompt*(sim: Sim, seat: int): string =
       "+ 0.4 × whether YOUR OWN vote is right. Both are in the range −1 " &
       "to +1. Getting the network right is worth more than being right " &
       "alone.\n" &
-      "- Your notes are private and are fed back to you every round.\n"
+      "- Your notes are private and are fed back to you every round.\n" &
+      "- Reply with ONLY one JSON object and no other text or markdown; put any private reasoning or ledger in the \"notes\" field.\n"
   else:
     var crew: seq[int]
     for other in sim.saboteurSeats:
@@ -305,7 +307,8 @@ proc systemPrompt*(sim: Sim, seat: int): string =
       "- A claim nobody can corroborate is a claim that gets you caught. " &
       "Fabricated counts, borrowed names, and agreeing loudly with a real " &
       "cog all work better than shouting.\n" &
-      "- Your notes are private and are fed back to you every round.\n"
+      "- Your notes are private and are fed back to you every round.\n" &
+      "- Reply with ONLY one JSON object and no other text or markdown; put any private reasoning or ledger in the \"notes\" field.\n"
 
 
 proc operatorBlock(prompt: string): string =
@@ -353,14 +356,14 @@ proc userPrompt*(sim: Sim, seat: int, prompt: string): string =
     (if sim.notes[seat].len > 0: sim.notes[seat] else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
   if ballot:
-    result.add("Reply with a JSON object like {\"vote\": \"A\", \"belief\": 70, " &
-      "\"reason\": \"…\", \"notes\": \"…\"} — vote is \"A\" (" &
+    result.add("Reply with ONLY a single JSON object (no analysis, prose, or extra text before or after), e.g. {\"vote\": \"A\", \"belief\": 70, " &
+      "\"reason\": \"...\", \"notes\": \"...\"} — vote is \"A\" (" &
       sim.optionA & ") or \"B\" (" & sim.optionB & "); belief 0-100; " &
       "reason at most " & $MaxReasonLen & " characters; notes at most " &
       $MaxNotesLen & " characters.")
   else:
-    result.add("Reply with a JSON object like {\"claim\": \"A\", \"confidence\": 70, " &
-      "\"belief\": 70, \"message\": \"…\", \"notes\": \"…\"} — claim is " &
+    result.add("Reply with ONLY a single JSON object (no analysis, prose, or extra text before or after), e.g. {\"claim\": \"A\", \"confidence\": 70, " &
+      "\"belief\": 70, \"message\": \"...\", \"notes\": \"...\"} — claim is " &
       "\"A\" (" & sim.optionA & "), \"B\" (" & sim.optionB & ") or " &
       "\"none\"; confidence and belief 0-100; message at most " &
       $MaxMessageLen & " characters (or \"\"); notes at most " &
